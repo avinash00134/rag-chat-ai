@@ -6,21 +6,13 @@ from pathlib import Path
 import json
 import numpy as np
 import datetime
-
-# Core dependencies
 import chromadb
 from chromadb.config import Settings
 from chromadb.utils import embedding_functions
-
-# Sentence Transformers for embeddings
 from sentence_transformers import SentenceTransformer
-
-# LangChain components
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain.memory import ConversationSummaryBufferMemory
-
-# OpenAI for LLM (only for response generation, not embeddings)
 import openai
 
 # Setup logging
@@ -128,11 +120,8 @@ class ChromaVectorStore:
     def __init__(self, collection_name: str = "rag_documents", embedding_model: str = "all-MiniLM-L6-v2"):
         self.collection_name = collection_name
         self.embedding_model_name = embedding_model
-        
-        # Initialize Sentence Transformer embeddings
         self.embeddings = SentenceTransformerEmbeddings(embedding_model)
         
-        # Initialize ChromaDB client
         self.client = chromadb.PersistentClient(path="./chroma_db")
         
         # Initialize collection
@@ -200,7 +189,6 @@ class ChromaVectorStore:
         """Search for similar documents"""
         logger.info(f"Searching for similar documents to query: '{query[:50]}...'")
         
-        # Generate query embedding
         query_embedding = self.embeddings.embed_query(query)
         
         # Search in ChromaDB
@@ -210,7 +198,6 @@ class ChromaVectorStore:
             include=['documents', 'metadatas', 'distances']
         )
         
-        # Format results
         formatted_results = []
         if results['documents'] and results['documents'][0]:
             for i, doc in enumerate(results['documents'][0]):
@@ -252,11 +239,11 @@ class ChatMemoryManager:
             memory_key="chat_history",
             return_messages=True
         )
-        self.chat_history = []  # For recent messages
+        self.chat_history = []
         self.compressed_history = ""
-        self.full_message_history = []  # Stores all messages exactly as sent/received
-        self.full_llm_responses = []  # Stores complete LLM responses with metadata
-        self.total_tokens_used = 0  # Track total token usage
+        self.full_message_history = []  
+        self.full_llm_responses = []  
+        self.total_tokens_used = 0
     
     def add_message(self, role: str, content: str):
         """Add a message to chat history and compress if needed"""
@@ -326,7 +313,6 @@ class ChatMemoryManager:
                 )
                 summary = response.choices[0].message.content
                 
-                # Track token usage for compression
                 if hasattr(response, 'usage'):
                     self.total_tokens_used += response.usage.total_tokens
             else:
@@ -403,20 +389,17 @@ class RAGApplication:
     """Main RAG Application class with open-source embeddings"""
     
     def __init__(self, openai_api_key: Optional[str] = None, embedding_model: str = "all-MiniLM-L6-v2"):
-        # Set OpenAI API key (optional, only needed for response generation)
         if openai_api_key:
             openai.api_key = openai_api_key
             os.environ["OPENAI_API_KEY"] = openai_api_key
             logger.info("OpenAI API key configured for response generation")
             
-            # Create proper LLM instance for memory with fallback
             try:
                 from langchain_openai import ChatOpenAI
                 self.llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.6)
                 logger.info("Using langchain_openai.ChatOpenAI")
             except ImportError:
                 try:
-                    # Fallback for older versions
                     from langchain.chat_models import ChatOpenAI
                     self.llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.6)
                     logger.info("Using langchain.chat_models.ChatOpenAI (fallback)")
@@ -427,7 +410,6 @@ class RAGApplication:
             logger.warning("No OpenAI API key provided. Response generation will be limited.")
             self.llm = None
         
-        # Initialize components with proper memory integration
         self.doc_processor = DocumentProcessor()
         self.vector_store = ChromaVectorStore(embedding_model=embedding_model)
         self.memory_manager = ChatMemoryManager(llm=self.llm)
@@ -511,7 +493,6 @@ class RAGApplication:
         """
         logger.info(f"Processing query: '{user_query[:50]}'... (length: {len(user_query)} chars)")
         
-        # Initialize variables with default values
         context = ""
         assistant_response = ""
         metadata = {
@@ -521,14 +502,11 @@ class RAGApplication:
         }
         
         try:
-            # Start timing for performance monitoring
             start_time = datetime.datetime.now()
             
-            # 1. Add user message to memory
             logger.debug("Adding user message to memory...")
             self.memory_manager.add_message("user", user_query)
             
-            # 2. Retrieve context if needed
             if use_context:
                 logger.debug("Retrieving context from vector store...")
                 context_start = datetime.datetime.now()
@@ -540,12 +518,10 @@ class RAGApplication:
                     "context_length": len(context)
                 })
             
-            # 3. Get chat history context
             logger.debug("Loading conversation context...")
             chat_context = self.memory_manager.get_context_for_llm()
             metadata["chat_history_length"] = len(str(chat_context))
             
-            # 4. Construct optimized prompt
             prompt = f"""You are an AI assistant that provides concise, accurate responses using Retrieval-Augmented Generation (RAG). Follow these rules:
             1. Response Structure:
             - First provide a 1-2 sentence direct answer
@@ -721,22 +697,18 @@ def main():
     print(f"Using embedding model: {args.model}")
     print("=" * 55)
     
-    # Get API key (optional) for the llm
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         print("No OpenAI API key found. You can still use document search functionality.")
         print("Set OPENAI_API_KEY environment variable for full response generation.")
     
-    # Initialize the application
     app = RAGApplication(api_key, embedding_model=args.model)
     
-    # Check for documents directory
     if not os.path.exists(args.documents):
         print(f"\nError: Documents directory '{args.documents}' not found.")
         print("Please create a 'documents' folder with your text files or specify path with --documents")
         return
     
-    # Load documents
     app.load_documents(args.documents)
     info = app.get_collection_info()
     print(f"\nLoaded {info['document_count']} document chunks")
@@ -810,7 +782,6 @@ def main():
             elif not user_input:
                 continue
             
-            # Generate response
             response = app.generate_response(user_input)
             print(f"\nAssistant: {response}")
             
