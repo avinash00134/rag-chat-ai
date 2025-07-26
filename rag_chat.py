@@ -26,9 +26,15 @@ import openai
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('rag_application.log')
+    ]
 )
 logger = logging.getLogger(__name__)
+# Set logging level for chromadb to WARNING to reduce noise
+logging.getLogger('chromadb').setLevel(logging.WARNING)
 
 
 class SentenceTransformerEmbeddings:
@@ -43,9 +49,13 @@ class SentenceTransformerEmbeddings:
         - multi-qa-MiniLM-L6-cos-v1: Optimized for Q&A
         """
         self.model_name = model_name
-        logger.info(f"Loading Sentence Transformer model: {model_name}")
-        self.model = SentenceTransformer(model_name)
-        logger.info(f"Model loaded successfully. Embedding dimension: {self.model.get_sentence_embedding_dimension()}")
+        try:
+            logger.info(f"Loading Sentence Transformer model: {model_name}")
+            self.model = SentenceTransformer(model_name)
+            logger.info(f"Model loaded successfully. Embedding dimension: {self.model.get_sentence_embedding_dimension()}")
+        except Exception as e:
+            logger.error(f"Failed to load model {model_name}: {str(e)}")
+            raise
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """Embed a list of documents"""
@@ -153,29 +163,38 @@ class ChromaVectorStore:
             logger.warning("No documents to add")
             return
         
-        logger.info(f"Adding {len(documents)} documents to vector store...")
+        logger.info(f"Adding {len(documents)} documents to vector store in batches of {batch_size}")
         
-        for i in range(0, len(documents), batch_size):
-            batch = documents[i:i + batch_size]
-            batch_texts = [doc.page_content for doc in batch]
-            batch_metadatas = [doc.metadata for doc in batch]
+        try:
+            for i in range(0, len(documents), batch_size):
+                batch = documents[i:i + batch_size]
+                batch_texts = [doc.page_content for doc in batch]
+                batch_metadatas = [doc.metadata for doc in batch]
+                
+                logger.debug(f"Processing batch {i//batch_size + 1}/{(len(documents)-1)//batch_size + 1}")
+                
+                try:
+                    batch_embeddings = self.embeddings.embed_documents(batch_texts)
+                    batch_ids = [f"doc_{i+j}" for j in range(len(batch))]
+                    
+                    self.collection.add(
+                        embeddings=batch_embeddings,
+                        documents=batch_texts,
+                        metadatas=batch_metadatas,
+                        ids=batch_ids
+                    )
+                    logger.debug(f"Added batch {i//batch_size + 1} ({len(batch)} documents)")
+                    
+                except Exception as batch_error:
+                    logger.error(f"Error processing batch {i//batch_size + 1}: {str(batch_error)}")
+                    continue
             
-            logger.info(f"Generating embeddings for batch {i//batch_size + 1}/{(len(documents)-1)//batch_size + 1}")
-            batch_embeddings = self.embeddings.embed_documents(batch_texts)
+            logger.info(f"Successfully added {len(documents)} document chunks to vector store")
             
-            batch_ids = [f"doc_{i+j}" for j in range(len(batch))]
-            
-            # Add batch to collection
-            self.collection.add(
-                embeddings=batch_embeddings,
-                documents=batch_texts,
-                metadatas=batch_metadatas,
-                ids=batch_ids
-            )
-            
-            logger.info(f"Added batch {i//batch_size + 1} ({len(batch)} documents)")
-        
-        logger.info(f"Successfully added all {len(documents)} document chunks to vector store")
+        except Exception as e:
+            logger.error(f"Fatal error adding documents: {str(e)}")
+            raise
+
     
     def similarity_search(self, query: str, k: int = 3) -> List[Dict[str, Any]]:
         """Search for similar documents"""
@@ -241,18 +260,24 @@ class ChatMemoryManager:
     
     def add_message(self, role: str, content: str):
         """Add a message to chat history and compress if needed"""
-        if role == "user":
-            self.memory.chat_memory.add_user_message(content)
-        else:
-            self.memory.chat_memory.add_ai_message(content)
-        
-        # Add to both temporary and permanent storage
-        message = {"role": role, "content": content}
-        self.chat_history.append(message)
-        self.full_message_history.append(message)
-        
-        if len(self.chat_history) > self.max_messages:
-            self._compress_history()
+        try:
+            if role == "user":
+                self.memory.chat_memory.add_user_message(content)
+            else:
+                self.memory.chat_memory.add_ai_message(content)
+            
+            message = {"role": role, "content": content}
+            self.chat_history.append(message)
+            self.full_message_history.append(message)
+            logger.debug(f"Added {role} message: {content[:50]}...")
+            
+            if len(self.chat_history) > self.max_messages:
+                logger.debug("Chat history exceeds max messages, compressing...")
+                self._compress_history()
+                
+        except Exception as e:
+            logger.error(f"Error adding message: {str(e)}")
+            raise
     
     def add_llm_response(self, query: str, response: str, context: str, metadata: Dict[str, Any] = None):
         """Store complete LLM response with metadata and track token usage"""
@@ -472,113 +497,187 @@ class RAGApplication:
         logger.info("Chat history cleared (including full messages)")
 
     def generate_response(self, user_query: str, use_context: bool = True) -> str:
-        """Generate concise, summary-style response using RAG"""
-        logger.info(f"Processing query: {user_query[:50]}...")
+        """Generate concise, summary-style response using RAG
         
-        self.memory_manager.add_message("user", user_query)
+        Args:
+            user_query: The user's input query
+            use_context: Whether to use context from the vector store (default: True)
+            
+        Returns:
+            str: The generated response or error message
+            
+        Raises:
+            Logs errors but doesn't raise them to maintain user experience
+        """
+        logger.info(f"Processing query: '{user_query[:50]}'... (length: {len(user_query)} chars)")
         
+        # Initialize variables with default values
         context = ""
-        if use_context:
-            context = self._retrieve_context(user_query)
+        assistant_response = ""
+        metadata = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "query_length": len(user_query),
+            "use_context": use_context
+        }
         
-        chat_context = self.memory_manager.get_context_for_llm()
-        
-        # Construct optimized prompt
-        prompt = f"""You are a helpful AI assistant that provides concise, summary-style responses. 
-Use the following context and conversation history to generate a focused response.
-
-{chat_context}
-
-{'Context from knowledge base:' + context if context else 'No additional context available.'}
-
-Current question: {user_query}
-
-Please provide a:
-1. Very brief summary of key points (1-2 sentences)
-2. Direct answer to the question (2-3 sentences)
-3. Any additional relevant details (bullet points)
-4. Key supporting facts from the context
-
-Keep the response under 150 words unless more detail is explicitly requested.
-DO NOT mention specific source file names."""
-
         try:
+            # Start timing for performance monitoring
+            start_time = datetime.datetime.now()
+            
+            # 1. Add user message to memory
+            logger.debug("Adding user message to memory...")
+            self.memory_manager.add_message("user", user_query)
+            
+            # 2. Retrieve context if needed
+            if use_context:
+                logger.debug("Retrieving context from vector store...")
+                context_start = datetime.datetime.now()
+                context = self._retrieve_context(user_query)
+                context_time = (datetime.datetime.now() - context_start).total_seconds()
+                logger.info(f"Context retrieval took {context_time:.2f} seconds")
+                metadata.update({
+                    "context_retrieval_time": context_time,
+                    "context_length": len(context)
+                })
+            
+            # 3. Get chat history context
+            logger.debug("Loading conversation context...")
+            chat_context = self.memory_manager.get_context_for_llm()
+            metadata["chat_history_length"] = len(str(chat_context))
+            
+            # 4. Construct optimized prompt
+            prompt = f"""You are an AI assistant that provides concise, accurate responses using Retrieval-Augmented Generation (RAG). Follow these rules:
+            1. Response Structure:
+            - First provide a 1-2 sentence direct answer
+            - Then include 3-5 bullet points of key supporting facts
+            - Keep total response under 150 words unless more detail is explicitly requested
+
+            2. Context Usage:
+            - Prioritize information from the provided context
+            - Never mention "according to the context" or similar phrases
+            - Synthesize information naturally into your response
+
+            3. Style Guidelines:
+            - Use professional but conversational tone
+            - Avoid redundant phrases like "based on the information provided"
+            - Format bullet points clearly with line breaks
+
+            4. Safety & Compliance:
+            - If context contradicts general knowledge, note this discreetly
+            - Flag any potentially harmful requests
+            - Never reveal file names or metadata from the context
+
+            5. Memory Management:
+            [When chat history exceeds 8 messages, automatically summarize earlier messages into:]
+            "Previous conversation summary: [concise 3-sentence summary of key points]"
+
+            Current Context:
+            {chat_context}
+
+            {'Context from knowledge base:' + context if context else 'No additional context available.'}
+
+            User Query: {user_query}
+
+            Keep the response under 150 words unless more detail is explicitly requested.
+            DO NOT mention specific source file names."""
+            
+            metadata.update({
+                "prompt_length": len(prompt),
+                "has_openai_key": bool(openai.api_key)
+            })
+            
+            # 5. Generate response using OpenAI or fallback
             if openai.api_key:
-                response = openai.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": "You are a concise AI assistant that summarizes information effectively."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=500,
-                    temperature=0.5
-                )
-                
-                assistant_response = response.choices[0].message.content
-                
-                # Prepare metadata with token usage if available
-                metadata = {
-                    "model": "gpt-3.5-turbo",
-                    "temperature": 0.5,
-                    "max_tokens": 500,
-                    "prompt_length": len(prompt)
-                }
-                
-                if hasattr(response, 'usage'):
-                    metadata['usage'] = {
-                        'prompt_tokens': response.usage.prompt_tokens,
-                        'completion_tokens': response.usage.completion_tokens,
-                        'total_tokens': response.usage.total_tokens
-                    }
-                
-                # Store complete LLM response with metadata
-                self.memory_manager.add_llm_response(
-                    query=user_query,
-                    response=assistant_response,
-                    context=context,
-                    metadata=metadata
-                )
+                logger.info("Generating response using OpenAI...")
+                try:
+                    llm_start = datetime.datetime.now()
+                    response = openai.chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=[
+                            {"role": "system", "content": "You are a concise AI assistant that summarizes information effectively."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        max_tokens=500,
+                        temperature=0.5
+                    )
+                    llm_time = (datetime.datetime.now() - llm_start).total_seconds()
+                    
+                    assistant_response = response.choices[0].message.content
+                    logger.debug(f"Received response from OpenAI: {assistant_response[:100]}...")
+                    
+                    # Update metadata with LLM details
+                    metadata.update({
+                        "model": "gpt-3.5-turbo",
+                        "temperature": 0.5,
+                        "max_tokens": 500,
+                        "llm_response_time": llm_time,
+                        "response_length": len(assistant_response)
+                    })
+                    
+                    if hasattr(response, 'usage'):
+                        metadata['usage'] = {
+                            'prompt_tokens': response.usage.prompt_tokens,
+                            'completion_tokens': response.usage.completion_tokens,
+                            'total_tokens': response.usage.total_tokens
+                        }
+                        logger.info(f"Token usage: {response.usage.total_tokens} (prompt: {response.usage.prompt_tokens}, completion: {response.usage.completion_tokens})")
+                    
+                except Exception as llm_error:
+                    logger.error(f"OpenAI API error: {str(llm_error)}", exc_info=True)
+                    assistant_response = f"""I encountered an error generating a response. Here's the relevant context:
+
+    {context if context else "No relevant context found."}"""
+                    metadata.update({
+                        "error": str(llm_error),
+                        "model": "openai_error"
+                    })
             else:
+                logger.warning("No OpenAI API key available - using fallback response")
                 assistant_response = f"""I can provide context but cannot generate full responses without an API key.
 
-Relevant context for "{user_query}":
-{context if context else "No relevant context found."}"""
-                
-                # Store response even without OpenAI
-                self.memory_manager.add_llm_response(
-                    query=user_query,
-                    response=assistant_response,
-                    context=context,
-                    metadata={
-                        "model": "local_context_only",
-                        "prompt_length": len(prompt)
-                    }
-                )
-
-            # Add assistant response to memory
+    Relevant context for "{user_query}":
+    {context if context else "No relevant context found."}"""
+                metadata.update({
+                    "model": "local_context_only"
+                })
+            
+            # 6. Store the complete response
+            self.memory_manager.add_llm_response(
+                query=user_query,
+                response=assistant_response,
+                context=context,
+                metadata=metadata
+            )
+            
+            # 7. Add assistant response to memory
             self.memory_manager.add_message("assistant", assistant_response)
+            
+            # Calculate total processing time
+            total_time = (datetime.datetime.now() - start_time).total_seconds()
+            logger.info(f"Response generation completed in {total_time:.2f} seconds")
+            metadata["total_processing_time"] = total_time
             
             return assistant_response
             
         except Exception as e:
-            logger.error(f"Error generating response: {e}")
-            error_response = f"Error generating response: {str(e)}"
+            logger.error(f"Unexpected error in generate_response: {str(e)}", exc_info=True)
+            error_response = f"An unexpected error occurred while generating a response: {str(e)}"
             if context:
                 error_response += f"\n\nRelevant context found:\n{context}"
             
-            # Store error response
+            # Store error response with metadata
+            metadata.update({
+                "error": str(e),
+                "model": "error"
+            })
             self.memory_manager.add_llm_response(
                 query=user_query,
                 response=error_response,
                 context=context,
-                metadata={
-                    "error": str(e),
-                    "model": "error"
-                }
+                metadata=metadata
             )
             
             return error_response
-
 
 def parse_arguments():
     """Parse command line arguments"""
